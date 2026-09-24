@@ -35,7 +35,9 @@ export async function GET(request: Request) {
 
     // 以重定向后的最终地址作为相对路径基准
     const baseUrl = upstream.url || url;
-    const filtered = filterAdsFromM3U8(text, baseUrl);
+    const filtered = filterAdsFromM3U8(text, baseUrl, {
+      keepDiscontinuity: true,
+    });
     const body = rewriteM3U8Urls(
       filtered,
       baseUrl,

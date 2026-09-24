@@ -40,7 +40,41 @@ function segmentInfo(uri: string, baseUrl?: string): SegmentInfo {
 interface SegmentGroup {
   lines: string[];
   segments: SegmentInfo[];
+  durations: number[];
   duration: number;
+}
+
+// 常见帧率对应的单帧时长；切片时长通常是帧时长的整数倍
+const FRAME_STEPS = [1 / 25, 1 / 30, 1 / 24, 1001 / 24000, 1001 / 30000];
+// #EXTINF 一般保留三位小数，允许的舍入误差
+const FRAME_TOLERANCE = 0.0006;
+// 正片时长至少有此比例落在某个帧网格上，才启用帧率判断
+const FRAME_GRID_COVERAGE = 0.9;
+
+function onFrameGrid(duration: number, step: number): boolean {
+  const k = Math.round(duration / step);
+  return k > 0 && Math.abs(duration - k * step) <= FRAME_TOLERANCE;
+}
+
+/**
+ * 找出覆盖正片的帧网格。插播广告常与正片帧率不同（如正片 25fps、广告 30fps），
+ * 其切片时长（5.567、3.333 等）无法落在正片帧网格上
+ */
+function mainFrameSteps(groups: SegmentGroup[]): number[] {
+  let total = 0;
+  const covered = FRAME_STEPS.map(() => 0);
+  for (const g of groups) {
+    for (const d of g.durations) {
+      total += d;
+      FRAME_STEPS.forEach((step, i) => {
+        if (onFrameGrid(d, step)) covered[i] += d;
+      });
+    }
+  }
+  if (total <= 0) return [];
+  return FRAME_STEPS.filter(
+    (_, i) => covered[i] / total >= FRAME_GRID_COVERAGE && covered[i] < total
+  );
 }
 
 // 找出按时长占比最大的特征；占比不足一半时说明该特征不稳定（如文件名为随机哈希），不予采用
@@ -79,11 +113,17 @@ function lastSeq(g: SegmentGroup): number | null {
 
 /**
  * 过滤 M3U8 中的广告：
- * 1. 按 #EXT-X-DISCONTINUITY 将分段分组，删除与正片路径/命名规则不一致、
+ * 1. 按 #EXT-X-DISCONTINUITY 将分段分组，删除与正片路径/命名规则、帧率不一致，
  *    或打断正片序号连续性的短分段组（插播广告）
- * 2. 移除所有 #EXT-X-DISCONTINUITY 标识
+ * 2. 默认移除所有 #EXT-X-DISCONTINUITY 标识（hls.js 下的原有行为）；
+ *    keepDiscontinuity 为 true 时保留正片分组之间的标识，供原生 HLS 播放使用，
+ *    避免时间戳跳变导致 Safari 卡顿
  */
-export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
+export function filterAdsFromM3U8(
+  content: string,
+  baseUrl?: string,
+  options: { keepDiscontinuity?: boolean } = {}
+): string {
   if (!content) return '';
 
   const lines = content.split('\n');
@@ -96,7 +136,12 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
   const header: string[] = [];
   const footer: string[] = [];
   const groups: SegmentGroup[] = [];
-  let current: SegmentGroup = { lines: [], segments: [], duration: 0 };
+  let current: SegmentGroup = {
+    lines: [],
+    segments: [],
+    durations: [],
+    duration: 0,
+  };
   let seenSegment = false;
   let pendingDuration = 0;
 
@@ -105,7 +150,7 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
 
     if (line.includes('#EXT-X-DISCONTINUITY')) {
       if (current.lines.length) groups.push(current);
-      current = { lines: [], segments: [], duration: 0 };
+      current = { lines: [], segments: [], durations: [], duration: 0 };
       continue;
     }
 
@@ -126,6 +171,7 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
       pendingDuration = parseFloat(line.slice(8)) || 0;
     } else if (line && !line.startsWith('#')) {
       current.segments.push(segmentInfo(line, baseUrl));
+      current.durations.push(pendingDuration);
       current.duration += pendingDuration;
       pendingDuration = 0;
     }
@@ -134,6 +180,7 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
 
   const lenSig = dominantSignature(groups, (seg) => seg.lenSig);
   const prefixSig = dominantSignature(groups, (seg) => seg.prefixSig);
+  const frameSteps = mainFrameSteps(groups);
 
   const isAd = (g: SegmentGroup, i: number): boolean => {
     if (groups.length <= 1 || g.segments.length === 0) return false;
@@ -145,7 +192,15 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
       return true;
     }
 
-    // 2. 序号不连续：前后两组正片序号首尾相接，而本组序号插不进去
+    // 2. 帧率与正片不一致：一半以上时长的切片落不到正片帧网格上
+    for (const step of frameSteps) {
+      const off = g.durations
+        .filter((d) => !onFrameGrid(d, step))
+        .reduce((a, b) => a + b, 0);
+      if (off * 2 >= g.duration) return true;
+    }
+
+    // 3. 序号不连续：前后两组正片序号首尾相接，而本组序号插不进去
     const prev = groups[i - 1];
     const next = groups[i + 1];
     if (prev && next) {
@@ -165,9 +220,19 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
   };
 
   // 广告组内的 KEY/MAP 标签仍需保留，后续正片分段可能沿用
-  const body = groups.flatMap((g, i) =>
-    !isAd(g, i) ? g.lines : g.lines.filter((l) => isSegmentTag(l.trim()))
-  );
+  const body: string[] = [];
+  let keptGroups = 0;
+  groups.forEach((g, i) => {
+    if (isAd(g, i)) {
+      body.push(...g.lines.filter((l) => isSegmentTag(l.trim())));
+      return;
+    }
+    if (options.keepDiscontinuity && keptGroups > 0) {
+      body.push('#EXT-X-DISCONTINUITY');
+    }
+    body.push(...g.lines);
+    keptGroups++;
+  });
 
   return [...header, ...body, ...footer].join('\n');
 }
