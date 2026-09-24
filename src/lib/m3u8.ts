@@ -14,24 +14,73 @@ function resolveUrl(uri: string, baseUrl?: string): string {
   }
 }
 
-// 分段特征：所在目录 + 文件名长度，广告分段通常来自不同路径/命名规则
-function segmentSignature(uri: string, baseUrl?: string): string {
+interface SegmentInfo {
+  // 所在目录 + 文件名长度
+  lenSig: string;
+  // 所在目录 + 去掉末尾序号后的文件名（如 abc123000045.ts -> abc123#.ts）
+  prefixSig: string;
+  // 文件名末尾序号，没有则为 null
+  seq: number | null;
+}
+
+// 分段特征：广告分段通常来自不同路径/命名规则，或打断正片分段的序号连续性
+function segmentInfo(uri: string, baseUrl?: string): SegmentInfo {
   const full = resolveUrl(uri, baseUrl).split('?')[0];
   const idx = full.lastIndexOf('/');
   const dir = full.slice(0, idx + 1);
   const name = full.slice(idx + 1);
-  return `${dir}|${name.length}`;
+  const m = name.match(/^(.*?)(\d+)(\.[a-z0-9]+)?$/i);
+  return {
+    lenSig: `${dir}|${name.length}`,
+    prefixSig: m ? `${dir}|${m[1]}#${m[3] || ''}` : `${dir}|${name}`,
+    seq: m && m[2].length <= 15 ? parseInt(m[2], 10) : null,
+  };
 }
 
 interface SegmentGroup {
   lines: string[];
-  signatures: string[];
+  segments: SegmentInfo[];
   duration: number;
+}
+
+// 找出按时长占比最大的特征；占比不足一半时说明该特征不稳定（如文件名为随机哈希），不予采用
+function dominantSignature(
+  groups: SegmentGroup[],
+  pick: (s: SegmentInfo) => string
+): string | null {
+  const durationBySig = new Map<string, number>();
+  let total = 0;
+  for (const g of groups) {
+    const per = g.segments.length ? g.duration / g.segments.length : 0;
+    for (const seg of g.segments) {
+      const sig = pick(seg);
+      durationBySig.set(sig, (durationBySig.get(sig) || 0) + per);
+      total += per;
+    }
+  }
+  let mainSig: string | null = null;
+  let max = -1;
+  durationBySig.forEach((d, sig) => {
+    if (d > max) {
+      max = d;
+      mainSig = sig;
+    }
+  });
+  return total > 0 && max / total >= 0.5 ? mainSig : null;
+}
+
+function firstSeq(g: SegmentGroup): number | null {
+  return g.segments.length ? g.segments[0].seq : null;
+}
+
+function lastSeq(g: SegmentGroup): number | null {
+  return g.segments.length ? g.segments[g.segments.length - 1].seq : null;
 }
 
 /**
  * 过滤 M3U8 中的广告：
- * 1. 按 #EXT-X-DISCONTINUITY 将分段分组，删除与正片特征不一致的短分段组（插播广告）
+ * 1. 按 #EXT-X-DISCONTINUITY 将分段分组，删除与正片路径/命名规则不一致、
+ *    或打断正片序号连续性的短分段组（插播广告）
  * 2. 移除所有 #EXT-X-DISCONTINUITY 标识
  */
 export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
@@ -47,7 +96,7 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
   const header: string[] = [];
   const footer: string[] = [];
   const groups: SegmentGroup[] = [];
-  let current: SegmentGroup = { lines: [], signatures: [], duration: 0 };
+  let current: SegmentGroup = { lines: [], segments: [], duration: 0 };
   let seenSegment = false;
   let pendingDuration = 0;
 
@@ -56,7 +105,7 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
 
     if (line.includes('#EXT-X-DISCONTINUITY')) {
       if (current.lines.length) groups.push(current);
-      current = { lines: [], signatures: [], duration: 0 };
+      current = { lines: [], segments: [], duration: 0 };
       continue;
     }
 
@@ -76,40 +125,48 @@ export function filterAdsFromM3U8(content: string, baseUrl?: string): string {
     if (line.startsWith('#EXTINF')) {
       pendingDuration = parseFloat(line.slice(8)) || 0;
     } else if (line && !line.startsWith('#')) {
-      current.signatures.push(segmentSignature(line, baseUrl));
+      current.segments.push(segmentInfo(line, baseUrl));
       current.duration += pendingDuration;
       pendingDuration = 0;
     }
   }
   if (current.lines.length) groups.push(current);
 
-  // 按特征统计时长，时长最长的即为正片特征
-  const durationBySig = new Map<string, number>();
-  for (const g of groups) {
-    const per = g.signatures.length ? g.duration / g.signatures.length : 0;
-    for (const sig of g.signatures) {
-      durationBySig.set(sig, (durationBySig.get(sig) || 0) + per);
-    }
-  }
-  let mainSig = '';
-  let maxDuration = -1;
-  durationBySig.forEach((d, sig) => {
-    if (d > maxDuration) {
-      maxDuration = d;
-      mainSig = sig;
-    }
-  });
+  const lenSig = dominantSignature(groups, (seg) => seg.lenSig);
+  const prefixSig = dominantSignature(groups, (seg) => seg.prefixSig);
 
-  const isMain = (g: SegmentGroup) =>
-    groups.length <= 1 ||
-    !mainSig ||
-    g.signatures.length === 0 ||
-    g.signatures.includes(mainSig) ||
-    g.duration > MAX_AD_GROUP_DURATION;
+  const isAd = (g: SegmentGroup, i: number): boolean => {
+    if (groups.length <= 1 || g.segments.length === 0) return false;
+    if (g.duration > MAX_AD_GROUP_DURATION) return false;
+
+    // 1. 路径或命名规则与正片不一致
+    if (lenSig && !g.segments.some((seg) => seg.lenSig === lenSig)) return true;
+    if (prefixSig && !g.segments.some((seg) => seg.prefixSig === prefixSig)) {
+      return true;
+    }
+
+    // 2. 序号不连续：前后两组正片序号首尾相接，而本组序号插不进去
+    const prev = groups[i - 1];
+    const next = groups[i + 1];
+    if (prev && next) {
+      const prevLast = lastSeq(prev);
+      const nextFirst = firstSeq(next);
+      const first = firstSeq(g);
+      if (
+        prevLast !== null &&
+        nextFirst !== null &&
+        nextFirst === prevLast + 1 &&
+        first !== prevLast + 1
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   // 广告组内的 KEY/MAP 标签仍需保留，后续正片分段可能沿用
-  const body = groups.flatMap((g) =>
-    isMain(g) ? g.lines : g.lines.filter((l) => isSegmentTag(l.trim()))
+  const body = groups.flatMap((g, i) =>
+    !isAd(g, i) ? g.lines : g.lines.filter((l) => isSegmentTag(l.trim()))
   );
 
   return [...header, ...body, ...footer].join('\n');
