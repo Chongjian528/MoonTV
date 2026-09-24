@@ -5,6 +5,48 @@
 // 被判定为广告的分段组最长时长（秒），超过则视为正片不做删除，避免误删
 const MAX_AD_GROUP_DURATION = 120;
 
+/**
+ * 已知广告的切片时长指纹（保留两位小数，每项为连续的若干个分组）。
+ * 各资源站会把同一段广告插入到不同影片，当广告与正片的路径、帧率都相同时
+ * （如电影天堂、如意、量子），只能靠时长指纹识别。
+ * 以下均为抽帧确认过的博彩广告；较短的指纹需与相邻分组一起匹配，避免误删正片
+ */
+const KNOWN_AD_FINGERPRINTS: string[][] = [
+  // 非凡、电影天堂
+  ['5.57,3.2', '5.37,3.33,1.6'],
+  ['5.57,2.93,5.7', '3.33,1.53'],
+  ['6.67,2.13', '3.23,3.73'],
+  ['6.67', '2.13,3.23,3.73'],
+  ['4.87,3.33,5.6,2.87,2.97'],
+  ['6.96,4,2.56,3.84'],
+  // 如意
+  ['4,5.48,2.92,4,4.32,1.28'],
+  ['4,4,4,4,4,1'],
+  // 量子
+  ['4,4,4,4,4,4,1.7'],
+  // iKun、魔都
+  ['3,3,5,3,3,0.64'],
+  ['3.33,1.67,1.67,2.93,1.67,1.67,1.67,1.67,1.3'],
+];
+
+function durationFingerprint(durations: number[]): string {
+  return durations.map((d) => String(Math.round(d * 100) / 100)).join(',');
+}
+
+// 返回命中已知广告指纹的分组下标
+function matchKnownAds(groups: SegmentGroup[]): Set<number> {
+  const fps = groups.map((g) => durationFingerprint(g.durations));
+  const hits = new Set<number>();
+  for (const pattern of KNOWN_AD_FINGERPRINTS) {
+    for (let i = 0; i + pattern.length <= fps.length; i++) {
+      if (pattern.every((p, k) => fps[i + k] === p)) {
+        pattern.forEach((_, k) => hits.add(i + k));
+      }
+    }
+  }
+  return hits;
+}
+
 function resolveUrl(uri: string, baseUrl?: string): string {
   if (!baseUrl) return uri;
   try {
@@ -181,10 +223,26 @@ export function filterAdsFromM3U8(
   const lenSig = dominantSignature(groups, (seg) => seg.lenSig);
   const prefixSig = dominantSignature(groups, (seg) => seg.prefixSig);
   const frameSteps = mainFrameSteps(groups);
+  const fingerprintAds = matchKnownAds(groups);
+  // 仅当切片文件名确实按序号递增时才启用序号规则，避免随机哈希文件名末尾数字巧合
+  let seqPairs = 0;
+  let seqHits = 0;
+  for (const g of groups) {
+    for (let j = 1; j < g.segments.length; j++) {
+      const a = g.segments[j - 1].seq;
+      const b = g.segments[j].seq;
+      seqPairs++;
+      if (a !== null && b === a + 1) seqHits++;
+    }
+  }
+  const sequentialNames = seqPairs > 0 && seqHits / seqPairs >= 0.8;
 
   const isAd = (g: SegmentGroup, i: number): boolean => {
     if (groups.length <= 1 || g.segments.length === 0) return false;
     if (g.duration > MAX_AD_GROUP_DURATION) return false;
+
+    // 0. 已知广告的时长指纹
+    if (fingerprintAds.has(i)) return true;
 
     // 1. 路径或命名规则与正片不一致
     if (lenSig && !g.segments.some((seg) => seg.lenSig === lenSig)) return true;
@@ -203,7 +261,7 @@ export function filterAdsFromM3U8(
     // 3. 序号不连续：前后两组正片序号首尾相接，而本组序号插不进去
     const prev = groups[i - 1];
     const next = groups[i + 1];
-    if (prev && next) {
+    if (sequentialNames && prev && next) {
       const prevLast = lastSeq(prev);
       const nextFirst = firstSeq(next);
       const first = firstSeq(g);
