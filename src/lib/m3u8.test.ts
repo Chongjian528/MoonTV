@@ -263,3 +263,103 @@ describe('filterAdsFromM3U8 with ffzy playlist', () => {
     expect(out.split('\n').slice(0, 6)).not.toContain('#EXT-X-DISCONTINUITY');
   });
 });
+
+// 按分组时长构造播放列表，切片名为随机哈希；返回每个分组的切片名
+function groupedPlaylist(groups: number[][]): {
+  m3u8: string;
+  names: string[][];
+} {
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:8'];
+  let n = 0;
+  const names = groups.map((g, i) => {
+    if (i > 0) lines.push('#EXT-X-DISCONTINUITY');
+    return g.map((d) => {
+      const name = `${(++n * 2246822519).toString(16).padStart(32, 'e')}.ts`;
+      lines.push(`#EXTINF:${d},`, name);
+      return name;
+    });
+  });
+  lines.push('#EXT-X-ENDLIST');
+  return { m3u8: lines.join('\n'), names };
+}
+
+function expectRemoved(groups: number[][], adGroups: number[]) {
+  const { m3u8, names } = groupedPlaylist(groups);
+  const out = filterAdsFromM3U8(m3u8, BASE);
+  expect(segmentsOf(out)).toEqual(
+    names.filter((_, i) => !adGroups.includes(i)).flat()
+  );
+}
+
+// 以下时长均取自各资源站真实播放列表，广告分组已抽帧确认
+describe('filterAdsFromM3U8 with known ad fingerprints', () => {
+  // 30fps 正片，帧率规则无法区分
+  const content30 = [
+    [4.2, 4.6, 3.5, 4.167, 3.767],
+    [4.9, 3.7, 4.467, 3.333, 4.833],
+    [2.833, 5.333, 3.1, 3.333, 4.933],
+    [3.333, 3.967, 4.067, 4.8, 3.533],
+  ];
+
+  it('removes 电影天堂 ads inside 30fps content', () => {
+    expectRemoved(
+      [
+        ...content30.slice(0, 2),
+        [5.567, 3.2],
+        [5.367, 3.333, 1.6],
+        ...content30.slice(2),
+        [6.667],
+        [2.133, 3.233, 3.733],
+        content30[0],
+      ],
+      [2, 3, 6, 7]
+    );
+  });
+
+  it('removes 如意 casino ads inside 25fps content', () => {
+    const content25 = [
+      [4.0, 4.0, 7.04, 4.0, 4.0, 2.4],
+      [5.12, 4.0, 4.68, 1.16, 4.0, 4.0],
+      [3.96, 4.0, 3.72, 4.0, 2.48, 4.0],
+    ];
+    expectRemoved(
+      [
+        content25[0],
+        [4.0, 5.48, 2.92, 4.0, 4.32, 1.28],
+        content25[1],
+        [4.0, 4.0, 4.0, 4.0, 4.0, 1.0],
+        content25[2],
+      ],
+      [1, 3]
+    );
+  });
+
+  it('removes 量子 ads inside 23.976fps content', () => {
+    const content = [4.004, 3.337, 4.004, 2.436, 4.004, 3.337, 4.004, 4.004];
+    expectRemoved(
+      [content, content, [4, 4, 4, 4, 4, 4, 1.7], content, content],
+      [2]
+    );
+  });
+
+  it('does not match short fingerprints on their own', () => {
+    expectRemoved([...content30.slice(0, 2), [6.667], content30[2]], []);
+  });
+});
+
+describe('filterAdsFromM3U8 sequence rule', () => {
+  it('ignores digits that happen to end random hash names', () => {
+    // 哈希文件名末尾恰好是 ...0 与 ...1，曾被误判为序号相连而删除中间的正片
+    const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:8'];
+    const group = (names: string[]) => {
+      for (const n of names) lines.push('#EXTINF:4.000,', n);
+    };
+    group(['f05d1645829d33f9d4.ts', '453780c7993e5292a16e0.ts']);
+    lines.push('#EXT-X-DISCONTINUITY');
+    group(['e54c4c58749d191d45ff.ts', 'e7c67e21dca36cf8752ad.ts']);
+    lines.push('#EXT-X-DISCONTINUITY');
+    group(['c794956470d92f64bc6d72098c8d28c1.ts', 'dc2f9c1440ec8446af1c3.ts']);
+    const out = filterAdsFromM3U8(lines.join('\n'), BASE);
+    expect(segmentsOf(out)).toHaveLength(6);
+  });
+});
