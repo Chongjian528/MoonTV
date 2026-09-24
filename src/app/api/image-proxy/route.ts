@@ -11,10 +11,25 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Missing image URL' }, { status: 400 });
   }
 
+  let target: URL;
+  try {
+    target = new URL(imageUrl);
+  } catch {
+    return NextResponse.json({ error: 'Invalid image URL' }, { status: 400 });
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    return NextResponse.json({ error: 'Invalid image URL' }, { status: 400 });
+  }
+
+  // 豆瓣图片需要豆瓣的 Referer，其他图片使用自身域名作为 Referer 以通过防盗链
+  const referer = /(^|\.)douban(io)?\.com$/i.test(target.hostname)
+    ? 'https://movie.douban.com/'
+    : `${target.origin}/`;
+
   try {
     const imageResponse = await fetch(imageUrl, {
       headers: {
-        Referer: 'https://movie.douban.com/',
+        Referer: referer,
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
       },

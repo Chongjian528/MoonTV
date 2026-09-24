@@ -41,6 +41,15 @@ export function processImageUrl(originalUrl: string): string {
 }
 
 /**
+ * 图片直连失败时的兜底地址：走站内 /api/image-proxy 由服务端拉取，
+ * 解决豆瓣图片防盗链、资源站 http 封面在 https 页面被拦截等问题
+ */
+export function getImageFallbackUrl(originalUrl: string): string | null {
+  if (!originalUrl || !/^https?:\/\//i.test(originalUrl)) return null;
+  return `/api/image-proxy?url=${encodeURIComponent(originalUrl)}`;
+}
+
+/**
  * 获取豆瓣代理 URL 设置
  */
 export function getDoubanProxyUrl(): string | null {

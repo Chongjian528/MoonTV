@@ -14,7 +14,7 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
-import { processImageUrl } from '@/lib/utils';
+import { getImageFallbackUrl, processImageUrl } from '@/lib/utils';
 
 import { ImagePlaceholder } from '@/components/ImagePlaceholder';
 
@@ -103,6 +103,23 @@ export default function VideoCard({
   const actualDoubanId = String(
     aggregateData?.mostFrequentDoubanId ?? douban_id
   );
+
+  const [imgSrc, setImgSrc] = useState(() => processImageUrl(actualPoster));
+  const [imgFailed, setImgFailed] = useState(false);
+  useEffect(() => {
+    setImgSrc(processImageUrl(actualPoster));
+    setImgFailed(false);
+  }, [actualPoster]);
+
+  // 直连加载失败时改走站内图片代理，仍失败则只显示占位
+  const handleImageError = useCallback(() => {
+    const fallback = getImageFallbackUrl(actualPoster);
+    if (fallback && imgSrc !== fallback) {
+      setImgSrc(fallback);
+    } else {
+      setImgFailed(true);
+    }
+  }, [actualPoster, imgSrc]);
   const actualEpisodes = aggregateData?.mostFrequentEpisodes ?? episodes;
   const actualYear = aggregateData?.first.year ?? year;
   const actualQuery = query || '';
@@ -277,14 +294,17 @@ export default function VideoCard({
         {/* 骨架屏 */}
         {!isLoading && <ImagePlaceholder aspectRatio='aspect-[2/3]' />}
         {/* 图片 */}
-        <Image
-          src={processImageUrl(actualPoster)}
-          alt={actualTitle}
-          fill
-          className='object-cover'
-          referrerPolicy='no-referrer'
-          onLoadingComplete={() => setIsLoading(true)}
-        />
+        {imgSrc && !imgFailed && (
+          <Image
+            src={imgSrc}
+            alt={actualTitle}
+            fill
+            className='object-cover'
+            referrerPolicy='no-referrer'
+            onLoadingComplete={() => setIsLoading(true)}
+            onError={handleImageError}
+          />
+        )}
 
         {/* 悬浮遮罩 */}
         <div className='absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent opacity-0 transition-opacity duration-300 ease-in-out group-hover:opacity-100' />
